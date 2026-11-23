@@ -1,12 +1,17 @@
-import { Component, signal } from '@angular/core';
-import { RouterOutlet } from '@angular/router';
+import { ChangeDetectionStrategy, Component, inject } from '@angular/core';
+import { DesktopSwitcher } from './components/desktop-switcher/desktop-switcher';
+import { TilingContainer } from './components/tiling-container/tiling-container';
+import { ThemeService } from './services/theme.service';
 
 @Component({
-  imports: [RouterOutlet],
   selector: 'app-root',
-  styleUrl: './app.css',
+  imports: [DesktopSwitcher, TilingContainer],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  host: { class: 'block h-dvh' },
   templateUrl: './app.html',
 })
 export class App {
-  protected readonly title = signal('nile');
+  constructor() {
+    inject(ThemeService);
+  }
 }

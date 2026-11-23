@@ -649,10 +649,255 @@ describe('LayoutEngine moveTile', () => {
   });
 });
 
-describe('LayoutEngine deferred operations', () => {
-  it('keeps serialization unimplemented', () => {
-    const state = LayoutEngine.createInitialState();
-    expect(() => LayoutEngine.toJSON(state)).toThrow('Not implemented');
-    expect(() => LayoutEngine.fromJSON({})).toThrow('Not implemented');
+describe('LayoutEngine serialization', () => {
+  function complexState(): LayoutState {
+    let state = LayoutEngine.createInitialState('main');
+    state = LayoutEngine.openTile(state, 'editor', {
+      height: 2,
+      props: { title: 'Notes', nested: { open: true }, tags: ['a', 'b'] },
+    });
+    state = LayoutEngine.openTile(state, 'terminal');
+    const editor = tileByComponent(state, 'editor');
+    state = LayoutEngine.updateTile(state, editor.id, { minHeight: 1 });
+    state = LayoutEngine.resizeTile(state, tileByComponent(state, 'terminal').id, 4);
+    state = LayoutEngine.createColumn(state, { width: 2, minWidth: 1 });
+    const sideColumn = columnAt(desktopAt(state), 1).id;
+    state = LayoutEngine.openTile(state, 'side', { columnId: sideColumn });
+    state = LayoutEngine.focus(state, columnAt(desktopAt(state)).id, editor.id);
+
+    state = LayoutEngine.createDesktop(state, 'other');
+    const otherId = desktopAt(state, 1).id;
+    state = LayoutEngine.openTile(state, 'mail', {
+      desktopId: otherId,
+      props: { unread: 3 },
+    });
+    return LayoutEngine.switchDesktop(state, otherId);
+  }
+
+  it('roundtrips a layout with desktops, columns, tiles, focus and props', () => {
+    const state = complexState();
+    const json = LayoutEngine.toJSON(state);
+    const encoded = JSON.parse(JSON.stringify(json)) as unknown;
+
+    expect(json).not.toBe(state);
+    expect(LayoutEngine.fromJSON(json)).toEqual(state);
+    expect(LayoutEngine.fromJSON(encoded)).toEqual(state);
+
+    const restored = LayoutEngine.fromJSON(json);
+    const props = tileByComponent(restored, 'editor').props as { title: string };
+    props.title = 'changed';
+    expect(tileByComponent(state, 'editor').props).toEqual({
+      title: 'Notes',
+      nested: { open: true },
+      tags: ['a', 'b'],
+    });
+    expect(desktopAt(restored).focused?.tileId).toBe(tileByComponent(restored, 'editor').id);
+    expect(desktopAt(restored, 1).focused?.tileId).toBe(tileByComponent(restored, 'mail', 1).id);
+    expect(restored.activeDesktopId).toBe(desktopAt(restored, 1).id);
+    expect(columnAt(desktopAt(restored), 1).minWidth).toBe(1);
+    expect(tileByComponent(restored, 'editor').minHeight).toBe(1);
+    expectShape(restored);
+  });
+
+  it('restores the minimal layout and recalculates order and position', () => {
+    const initial = LayoutEngine.createInitialState('main');
+    expect(LayoutEngine.toJSON(initial)).toEqual({
+      activeDesktopId: initial.activeDesktopId,
+      desktops: [{ id: initial.activeDesktopId, order: 1, name: 'main', columns: [] }],
+    });
+    expect(LayoutEngine.fromJSON(LayoutEngine.toJSON(initial))).toEqual(initial);
+
+    const raw = {
+      activeDesktopId: 'beta',
+      desktops: [
+        {
+          id: 'alpha',
+          name: 'A',
+          order: 9,
+          columns: [
+            {
+              id: 'col',
+              width: 2,
+              tiles: [
+                { id: 'second', componentId: 'two', height: 1, position: 5 },
+                { id: 'first', componentId: 'one', height: 3 },
+              ],
+            },
+          ],
+        },
+        { id: 'beta', name: 'B', columns: [] },
+      ],
+    };
+    const parsed = LayoutEngine.fromJSON(freeze(structuredClone(raw)));
+
+    expect(parsed.activeDesktopId).toBe('beta');
+    expect(parsed.desktops.map((desktop) => desktop.order)).toEqual([1, 2]);
+    expect(parsed.desktops.map((desktop) => desktop.name)).toEqual(['A', 'B']);
+    expect(columnAt(desktopAt(parsed)).tiles.map((tile) => [tile.id, tile.position])).toEqual([
+      ['second', 0],
+      ['first', 1],
+    ]);
+    expect(raw.desktops[0]?.order).toBe(9);
+    expectShape(parsed);
+
+    const minimal = LayoutEngine.fromJSON({
+      activeDesktopId: 'desk',
+      desktops: [{ id: 'desk', name: '1', columns: [] }],
+    });
+    expect(minimal).toEqual({
+      activeDesktopId: 'desk',
+      desktops: [{ id: 'desk', order: 1, name: '1', columns: [] }],
+    });
+  });
+
+  it('rejects malformed structure, types, and broken ids', () => {
+    const validDesktop = { id: 'desk', name: '1', columns: [] };
+    const cases: Array<[unknown, string]> = [
+      [null, 'Layout state must be an object'],
+      [[], 'Layout state must be an object'],
+      [{ activeDesktopId: 'desk' }, 'Layout state desktops must be an array'],
+      [{ desktops: [], activeDesktopId: 'desk' }, 'Layout state must contain at least one desktop'],
+      [{ desktops: [validDesktop], activeDesktopId: 1 }, 'Active desktop id must be a string'],
+      [{ desktops: [validDesktop], activeDesktopId: 'missing' }, 'Desktop not found: missing'],
+      [{ desktops: [null], activeDesktopId: 'desk' }, 'Desktop at index 0 must be an object'],
+      [
+        { desktops: [{ id: '', name: '1', columns: [] }], activeDesktopId: '' },
+        'Desktop id must not be empty',
+      ],
+      [
+        { desktops: [{ id: 'desk', name: '   ', columns: [] }], activeDesktopId: 'desk' },
+        'Desktop name must not be empty',
+      ],
+      [
+        {
+          desktops: [
+            { id: 'desk', name: '1', columns: [] },
+            { id: 'desk', name: '2', columns: [] },
+          ],
+          activeDesktopId: 'desk',
+        },
+        'Duplicate desktop id: desk',
+      ],
+      [
+        {
+          desktops: [{ id: 'desk', name: '1', columns: [{ id: 'col', width: 'wide', tiles: [] }] }],
+          activeDesktopId: 'desk',
+        },
+        'Column width must be a finite number greater than 0',
+      ],
+      [
+        {
+          desktops: [
+            {
+              id: 'desk',
+              name: '1',
+              columns: [
+                { id: 'col', width: 1, tiles: [{ id: 4, componentId: 'panel', height: 1 }] },
+              ],
+            },
+          ],
+          activeDesktopId: 'desk',
+        },
+        'Tile id must be a string',
+      ],
+      [
+        {
+          desktops: [
+            {
+              id: 'desk',
+              name: '1',
+              columns: [
+                {
+                  id: 'col',
+                  width: 1,
+                  tiles: [
+                    { id: 'tile', componentId: 'panel', height: 1 },
+                    { id: 'tile', componentId: 'other', height: 1 },
+                  ],
+                },
+              ],
+            },
+          ],
+          activeDesktopId: 'desk',
+        },
+        'Duplicate tile id: tile',
+      ],
+      [
+        {
+          desktops: [
+            {
+              id: 'desk',
+              name: '1',
+              columns: [{ id: 'col', width: 1, tiles: [] }],
+              focused: { columnId: 'missing', tileId: 'tile' },
+            },
+          ],
+          activeDesktopId: 'desk',
+        },
+        'Column not found: missing',
+      ],
+      [
+        {
+          desktops: [
+            {
+              id: 'desk',
+              name: '1',
+              columns: [
+                {
+                  id: 'col',
+                  width: 1,
+                  tiles: [{ id: 'tile', componentId: 'panel', height: 1, props: [] }],
+                },
+              ],
+            },
+          ],
+          activeDesktopId: 'desk',
+        },
+        'Tile props must be an object',
+      ],
+      [
+        {
+          desktops: [
+            {
+              id: 'desk',
+              name: '1',
+              columns: [
+                {
+                  id: 'col',
+                  width: 1,
+                  tiles: [{ id: 'tile', componentId: 'panel', height: 1, position: 'bad' }],
+                },
+              ],
+            },
+          ],
+          activeDesktopId: 'desk',
+        },
+        'Tile position must be a finite number',
+      ],
+      [
+        {
+          desktops: [
+            {
+              id: 'desk',
+              name: '1',
+              columns: [
+                {
+                  id: 'col',
+                  width: 1,
+                  tiles: [{ id: 'tile', componentId: 'panel', height: 1 }],
+                },
+              ],
+              focused: { columnId: 'col', tileId: 'missing' },
+            },
+          ],
+          activeDesktopId: 'desk',
+        },
+        'Tile not found: missing',
+      ],
+    ];
+
+    for (const [data, message] of cases) {
+      expect(() => LayoutEngine.fromJSON(data)).toThrow(message);
+    }
   });
 });

@@ -443,19 +443,22 @@ export class LayoutEngine {
   }
 
   /**
-   * Сериализует состояние в JSON-совместимый объект.
+   * Сериализует состояние в plain object для `JSON.stringify`.
+   * Возвращает копию: поля `state` и вложенные `props` не разделяются с результатом.
    */
   static toJSON(state: LayoutState): unknown {
-    void state;
-    throw new Error('Not implemented');
+    return toPlainJson(serializeState(state));
   }
 
   /**
-   * Восстанавливает состояние из JSON.
+   * Восстанавливает состояние из plain object или результата `JSON.parse`.
+   * Проверяет структуру, типы и ссылки между id.
+   * `order` десктопов и `position` тайлов выставляет по фактическому порядку элементов.
+   *
+   * @throws Если данные не являются корректным состоянием раскладки.
    */
   static fromJSON(data: unknown): LayoutState {
-    void data;
-    throw new Error('Not implemented');
+    return parseLayoutState(data);
   }
 }
 
@@ -942,4 +945,255 @@ function insertMovedTile(columns: Column[], tile: Tile, plan: MovePlan): ColumnI
 
 function assertNever(value: never): never {
   throw new Error(`Unknown move direction: ${String(value)}`);
+}
+
+interface SerializedTile {
+  id: string;
+  componentId: string;
+  height: number;
+  position: number;
+  props?: Record<string, unknown>;
+  minHeight?: number;
+}
+
+interface SerializedColumn {
+  id: string;
+  width: number;
+  tiles: SerializedTile[];
+  minWidth?: number;
+}
+
+interface SerializedDesktop {
+  id: string;
+  order: number;
+  name: string;
+  columns: SerializedColumn[];
+  focused?: {
+    columnId: string;
+    tileId: string;
+  };
+}
+
+interface SerializedLayout {
+  desktops: SerializedDesktop[];
+  activeDesktopId: string;
+}
+
+interface ParseIds {
+  desktops: Set<string>;
+  columns: Set<string>;
+  tiles: Set<string>;
+}
+
+function serializeState(state: LayoutState): SerializedLayout {
+  return {
+    activeDesktopId: state.activeDesktopId,
+    desktops: state.desktops.map((desktop) => serializeDesktop(desktop)),
+  };
+}
+
+function serializeDesktop(desktop: Desktop): SerializedDesktop {
+  const serialized: SerializedDesktop = {
+    id: desktop.id,
+    order: desktop.order,
+    name: desktop.name,
+    columns: desktop.columns.map((column) => serializeColumn(column)),
+  };
+  if (desktop.focused !== undefined) {
+    serialized.focused = {
+      columnId: desktop.focused.columnId,
+      tileId: desktop.focused.tileId,
+    };
+  }
+  return serialized;
+}
+
+function serializeColumn(column: Column): SerializedColumn {
+  const serialized: SerializedColumn = {
+    id: column.id,
+    width: column.width,
+    tiles: column.tiles.map((tile) => serializeTile(tile)),
+  };
+  if (column.minWidth !== undefined) serialized.minWidth = column.minWidth;
+  return serialized;
+}
+
+function serializeTile(tile: Tile): SerializedTile {
+  const serialized: SerializedTile = {
+    id: tile.id,
+    componentId: tile.componentId,
+    height: tile.height,
+    position: tile.position,
+  };
+  if (tile.props !== undefined) serialized.props = tile.props;
+  if (tile.minHeight !== undefined) serialized.minHeight = tile.minHeight;
+  return serialized;
+}
+
+function toPlainJson(value: SerializedLayout): unknown {
+  const text = JSON.stringify(value);
+  if (text === undefined) throw new Error('Layout state must be JSON-serializable');
+  return JSON.parse(text) as unknown;
+}
+
+function parseLayoutState(data: unknown): LayoutState {
+  const record = readRecord(data, 'Layout state');
+  const ids: ParseIds = { desktops: new Set(), columns: new Set(), tiles: new Set() };
+  const desktops = readArray(record['desktops'], 'Layout state desktops').map((item, index) =>
+    parseDesktop(item, index, ids),
+  );
+  if (desktops.length === 0) throw new Error('Layout state must contain at least one desktop');
+
+  const activeDesktopId = readId(record['activeDesktopId'], 'Active desktop id');
+  if (!desktops.some((desktop) => desktop.id === activeDesktopId)) {
+    throw new Error(`Desktop not found: ${activeDesktopId}`);
+  }
+  return { activeDesktopId, desktops: withOrders(desktops) };
+}
+
+function parseDesktop(data: unknown, index: number, ids: ParseIds): Desktop {
+  const record = readRecord(data, `Desktop at index ${index}`);
+  const id = readId(record['id'], 'Desktop id');
+  trackId(ids.desktops, id, 'desktop');
+  const name = readString(record['name'], 'Desktop name');
+  assertDesktopName(name);
+  readOptionalFinite(record['order'], 'Desktop order');
+
+  const columns = readArray(record['columns'], 'Desktop columns').map((item, columnIndex) =>
+    parseColumn(item, columnIndex, ids),
+  );
+  const focused = readFocus(record['focused'], columns);
+  const desktop: Desktop = { id, order: 0, name, columns };
+  if (focused !== undefined) desktop.focused = focused;
+  return desktop;
+}
+
+function parseColumn(data: unknown, index: number, ids: ParseIds): Column {
+  const record = readRecord(data, `Column at index ${index}`);
+  const id = readId(record['id'], 'Column id');
+  trackId(ids.columns, id, 'column');
+  const width = readPositive(record['width'], 'Column width');
+  const minWidth = readOptionalPositive(record['minWidth'], 'Column minWidth');
+  if (minWidth !== undefined && width < minWidth) {
+    throw new Error('Column width must not be less than minWidth');
+  }
+
+  const tiles = withPositions(
+    readArray(record['tiles'], 'Column tiles').map((item, tileIndex) =>
+      parseTile(item, tileIndex, ids),
+    ),
+  );
+  const column: Column = { id, width, tiles };
+  if (minWidth !== undefined) column.minWidth = minWidth;
+  return column;
+}
+
+function parseTile(data: unknown, index: number, ids: ParseIds): Tile {
+  const record = readRecord(data, `Tile at index ${index}`);
+  const id = readId(record['id'], 'Tile id');
+  trackId(ids.tiles, id, 'tile');
+  const componentId = readString(record['componentId'], 'componentId');
+  assertComponentId(componentId);
+  const height = readPositive(record['height'], 'Tile height');
+  const minHeight = readOptionalPositive(record['minHeight'], 'Tile minHeight');
+  if (minHeight !== undefined && height < minHeight) {
+    throw new Error('Tile height must not be less than minHeight');
+  }
+  readOptionalFinite(record['position'], 'Tile position');
+
+  const tile: Tile = { id, componentId, height, position: index };
+  if (minHeight !== undefined) tile.minHeight = minHeight;
+  if (record['props'] !== undefined) tile.props = readProps(record['props']);
+  return tile;
+}
+
+function readFocus(value: unknown, columns: readonly Column[]): Desktop['focused'] {
+  if (value === undefined) return undefined;
+  const record = readRecord(value, 'Desktop focus');
+  const columnId = readId(record['columnId'], 'Focus column id');
+  const tileId = readId(record['tileId'], 'Focus tile id');
+  const column = columns.find((item) => item.id === columnId);
+  if (column === undefined) throw new Error(`Column not found: ${columnId}`);
+  if (!column.tiles.some((tile) => tile.id === tileId))
+    throw new Error(`Tile not found: ${tileId}`);
+  return { columnId, tileId };
+}
+
+function readProps(value: unknown): Record<string, unknown> {
+  const record = readRecord(value, 'Tile props');
+  return cloneJsonObject(record, 'Tile props');
+}
+
+function cloneJsonObject(value: Record<string, unknown>, label: string): Record<string, unknown> {
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    Object.defineProperty(copy, key, {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: cloneJsonValue(value[key], `${label}.${key}`),
+    });
+  }
+  return copy;
+}
+
+function cloneJsonValue(value: unknown, label: string): unknown {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error(`${label} must be JSON-serializable`);
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item, index) => cloneJsonValue(item, `${label}[${index}]`));
+  }
+  if (isRecord(value)) return cloneJsonObject(value, label);
+  throw new Error(`${label} must be JSON-serializable`);
+}
+
+function readRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`${label} must be an object`);
+  return value;
+}
+
+function readArray(value: unknown, label: string): unknown[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value;
+}
+
+function readString(value: unknown, label: string): string {
+  if (typeof value !== 'string') throw new Error(`${label} must be a string`);
+  return value;
+}
+
+function readId(value: unknown, label: string): string {
+  const id = readString(value, label);
+  if (id.trim() === '') throw new Error(`${label} must not be empty`);
+  return id;
+}
+
+function readPositive(value: unknown, label: string): number {
+  if (typeof value !== 'number') throw new Error(`${label} must be a finite number greater than 0`);
+  assertPositive(value, label);
+  return value;
+}
+
+function readOptionalPositive(value: unknown, label: string): number | undefined {
+  if (value === undefined) return undefined;
+  return readPositive(value, label);
+}
+
+function readOptionalFinite(value: unknown, label: string): void {
+  if (value === undefined) return;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(`${label} must be a finite number`);
+  }
+}
+
+function trackId(ids: Set<string>, id: string, label: string): void {
+  if (ids.has(id)) throw new Error(`Duplicate ${label} id: ${id}`);
+  ids.add(id);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

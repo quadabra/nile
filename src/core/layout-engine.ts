@@ -28,6 +28,25 @@ interface TileLocation extends ColumnLocation {
   tileIndex: number;
 }
 
+type MovePlan =
+  | {
+      kind: 'column';
+      desktopIndex: number;
+      columnId: ColumnId;
+      tileIndex: number;
+    }
+  | {
+      kind: 'new-column';
+      desktopIndex: number;
+      newColumnIndex: number;
+      tileIndex: number;
+    };
+
+interface MoveAnchor {
+  desktopIndex: number;
+  columnIndex?: number;
+}
+
 const DEFAULT_COLUMN_WIDTH = 1;
 const DEFAULT_TILE_HEIGHT = 1;
 
@@ -373,13 +392,31 @@ export class LayoutEngine {
   }
 
   /**
-   * Перемещает тайл (между колонками, внутри колонки, в новый столбец и т.д.).
+   * Перемещает тайл внутри колонки, в другую колонку, в новый столбец или на другой десктоп.
+   *
+   * `columnId` и `index` задают место напрямую. Без `index` тайл остаётся на своём
+   * месте в той же колонке и добавляется в конец чужой. `desktopId` выбирает десктоп;
+   * на пустом десктопе тайл встаёт в новую колонку.
+   *
+   * `direction: 'up' | 'down'` сдвигает тайл на одну позицию. Переданный `index`
+   * заменяет этот шаг. `'left' | 'right'` переносят в соседнюю колонку того же
+   * десктопа, сохраняя ряд, если в ней хватает места. На другом десктопе они
+   * создают колонку слева или справа. `'new-column'`
+   * выделяет тайл в столбец справа от текущего. Если тайл уже один в колонке
+   * и столбец оказался бы на том же месте, возвращается тот же `state`.
+   *
+   * Край без соседней колонки и шаг за границей колонки тоже не меняют состояние.
+   * Несуществующие десктоп, колонка и тайл дают ошибку.
+   *
+   * Фокус следует за тайлом, только если перемещали сфокусированный тайл.
+   * Когда он уходит на другой десктоп, на прежнем фокус переходит к соседу,
+   * как при `closeTile`. Активный десктоп не переключается.
    */
   static moveTile(state: LayoutState, tileId: TileId, target: MoveTileTarget): LayoutState {
-    void state;
-    void tileId;
-    void target;
-    throw new Error('Not implemented');
+    const source = requireTile(state, tileId);
+    const plan = planMove(state, source, target);
+    if (plan === undefined) return state;
+    return commitMove(state, source, plan);
   }
 
   /**
@@ -644,4 +681,265 @@ function assertInsertIndex(index: number, length: number, label: string): void {
   if (!Number.isInteger(index) || index < 0 || index > length) {
     throw new Error(`${label} out of range: ${index}`);
   }
+}
+
+function planMove(
+  state: LayoutState,
+  source: TileLocation,
+  target: MoveTileTarget,
+): MovePlan | undefined {
+  const anchor = resolveMoveAnchor(state, source, target);
+  if (target.direction !== undefined) return planDirection(state, source, target, anchor);
+  return planExplicit(state, source, target, anchor);
+}
+
+function resolveMoveAnchor(
+  state: LayoutState,
+  source: TileLocation,
+  target: MoveTileTarget,
+): MoveAnchor {
+  if (target.columnId !== undefined) {
+    const location = requireColumn(state, target.columnId, target.desktopId);
+    return { desktopIndex: location.desktopIndex, columnIndex: location.columnIndex };
+  }
+  if (target.desktopId !== undefined) {
+    const desktopIndex = requireDesktopIndex(state, target.desktopId);
+    if (desktopIndex === source.desktopIndex) {
+      return { desktopIndex, columnIndex: source.columnIndex };
+    }
+    return { desktopIndex };
+  }
+  return { desktopIndex: source.desktopIndex, columnIndex: source.columnIndex };
+}
+
+function planExplicit(
+  state: LayoutState,
+  source: TileLocation,
+  target: MoveTileTarget,
+  anchor: MoveAnchor,
+): MovePlan | undefined {
+  const desktop = desktopAt(state, anchor.desktopIndex);
+  const sameDesktop = anchor.desktopIndex === source.desktopIndex;
+
+  if (anchor.columnIndex === undefined) {
+    if (sameDesktop && target.index === undefined) return undefined;
+    if (desktop.columns.length === 0) return planFreshColumn(anchor.desktopIndex, 0, target.index);
+    const column = columnAt(desktop, landingColumnIndex(desktop));
+    return planIntoColumn(source, anchor.desktopIndex, column, target.index, false);
+  }
+
+  const column = columnAt(desktop, anchor.columnIndex);
+  const sameColumn = sameDesktop && column.id === sourceColumn(state, source).id;
+  return planIntoColumn(source, anchor.desktopIndex, column, target.index, sameColumn);
+}
+
+function planDirection(
+  state: LayoutState,
+  source: TileLocation,
+  target: MoveTileTarget,
+  anchor: MoveAnchor,
+): MovePlan | undefined {
+  switch (target.direction) {
+    case 'up':
+    case 'down':
+      return planVertical(state, source, target, anchor, target.direction);
+    case 'left':
+    case 'right':
+      return planHorizontal(state, source, target, anchor, target.direction);
+    case 'new-column':
+      return planNewColumn(state, source, target, anchor);
+    case undefined:
+      return undefined;
+    default:
+      return assertNever(target.direction);
+  }
+}
+
+function planVertical(
+  state: LayoutState,
+  source: TileLocation,
+  target: MoveTileTarget,
+  anchor: MoveAnchor,
+  direction: 'up' | 'down',
+): MovePlan | undefined {
+  const desktop = desktopAt(state, anchor.desktopIndex);
+  const columnIndex =
+    anchor.columnIndex ??
+    (desktop.columns.length === 0 ? undefined : verticalColumnIndex(desktop, direction));
+  if (columnIndex === undefined) return planFreshColumn(anchor.desktopIndex, 0, target.index);
+
+  const column = columnAt(desktop, columnIndex);
+  const sameColumn =
+    anchor.desktopIndex === source.desktopIndex && column.id === sourceColumn(state, source).id;
+  if (target.index !== undefined || !sameColumn) {
+    const tileIndex = target.index ?? (direction === 'up' ? 0 : column.tiles.length);
+    return planIntoColumn(source, anchor.desktopIndex, column, tileIndex, sameColumn);
+  }
+
+  const next = source.tileIndex + (direction === 'up' ? -1 : 1);
+  if (next < 0 || next >= column.tiles.length) return undefined;
+  return {
+    kind: 'column',
+    desktopIndex: anchor.desktopIndex,
+    columnId: column.id,
+    tileIndex: next,
+  };
+}
+
+function planHorizontal(
+  state: LayoutState,
+  source: TileLocation,
+  target: MoveTileTarget,
+  anchor: MoveAnchor,
+  direction: 'left' | 'right',
+): MovePlan | undefined {
+  const desktop = desktopAt(state, anchor.desktopIndex);
+  const enteringDesktop =
+    anchor.desktopIndex !== source.desktopIndex && anchor.columnIndex === undefined;
+  if (enteringDesktop) {
+    const newColumnIndex = direction === 'left' ? 0 : desktop.columns.length;
+    return planFreshColumn(anchor.desktopIndex, newColumnIndex, target.index);
+  }
+
+  const columnIndex = anchor.columnIndex ?? source.columnIndex;
+  const neighborIndex = columnIndex + (direction === 'left' ? -1 : 1);
+  const neighbor = desktop.columns[neighborIndex];
+  if (neighbor === undefined) return undefined;
+
+  const tileIndex = target.index ?? Math.min(source.tileIndex, neighbor.tiles.length);
+  const sameColumn =
+    anchor.desktopIndex === source.desktopIndex && neighbor.id === sourceColumn(state, source).id;
+  return planIntoColumn(source, anchor.desktopIndex, neighbor, tileIndex, sameColumn);
+}
+
+function planNewColumn(
+  state: LayoutState,
+  source: TileLocation,
+  target: MoveTileTarget,
+  anchor: MoveAnchor,
+): MovePlan | undefined {
+  const desktop = desktopAt(state, anchor.desktopIndex);
+  const sameDesktop = anchor.desktopIndex === source.desktopIndex;
+  const sourceAlone = sourceColumn(state, source).tiles.length === 1;
+
+  if (!sameDesktop && anchor.columnIndex === undefined) {
+    return planFreshColumn(anchor.desktopIndex, desktop.columns.length, target.index);
+  }
+
+  const anchorIndex = anchor.columnIndex ?? source.columnIndex;
+  let newColumnIndex = anchorIndex + 1;
+  // Удаление исходной колонки сдвигает индексы справа от неё.
+  if (sameDesktop && sourceAlone && source.columnIndex < newColumnIndex) newColumnIndex -= 1;
+  if (sameDesktop && sourceAlone && newColumnIndex === source.columnIndex) return undefined;
+  return planFreshColumn(anchor.desktopIndex, newColumnIndex, target.index);
+}
+
+function planFreshColumn(
+  desktopIndex: number,
+  newColumnIndex: number,
+  tileIndex: number | undefined,
+): MovePlan {
+  const index = tileIndex ?? 0;
+  assertInsertIndex(index, 0, 'Tile index');
+  return { kind: 'new-column', desktopIndex, newColumnIndex, tileIndex: index };
+}
+
+function planIntoColumn(
+  source: TileLocation,
+  desktopIndex: number,
+  column: Column,
+  index: number | undefined,
+  sameColumn: boolean,
+): MovePlan | undefined {
+  if (sameColumn) {
+    const tileIndex = index ?? source.tileIndex;
+    assertInsertIndex(tileIndex, Math.max(column.tiles.length - 1, 0), 'Tile index');
+    if (tileIndex === source.tileIndex) return undefined;
+    return { kind: 'column', desktopIndex, columnId: column.id, tileIndex };
+  }
+
+  const tileIndex = index ?? column.tiles.length;
+  assertInsertIndex(tileIndex, column.tiles.length, 'Tile index');
+  return { kind: 'column', desktopIndex, columnId: column.id, tileIndex };
+}
+
+function landingColumnIndex(desktop: Desktop): number {
+  if (desktop.focused !== undefined) {
+    const focusedIndex = desktop.columns.findIndex(
+      (column) => column.id === desktop.focused?.columnId,
+    );
+    if (focusedIndex >= 0) return focusedIndex;
+  }
+  return Math.max(desktop.columns.length - 1, 0);
+}
+
+function verticalColumnIndex(desktop: Desktop, direction: 'up' | 'down'): number {
+  return direction === 'up' ? 0 : desktop.columns.length - 1;
+}
+
+function sourceColumn(state: LayoutState, source: TileLocation): Column {
+  return columnAt(desktopAt(state, source.desktopIndex), source.columnIndex);
+}
+
+function commitMove(state: LayoutState, source: TileLocation, plan: MovePlan): LayoutState {
+  const sourceDesktop = desktopAt(state, source.desktopIndex);
+  const origin = sourceColumn(state, source);
+  const tile = tileAt(sourceDesktop, source);
+  const movedWasFocused = sourceDesktop.focused?.tileId === tile.id;
+  const sameDesktop = plan.desktopIndex === source.desktopIndex;
+
+  const remaining = withPositions(origin.tiles.filter((item) => item.id !== tile.id));
+  const sourceColumnRemoved = remaining.length === 0;
+  const sourceColumns = sourceDesktop.columns.slice();
+  if (sourceColumnRemoved) sourceColumns.splice(source.columnIndex, 1);
+  else sourceColumns[source.columnIndex] = { ...origin, tiles: remaining };
+
+  const destDesktop = sameDesktop ? sourceDesktop : desktopAt(state, plan.desktopIndex);
+  const destColumns = sameDesktop ? sourceColumns : destDesktop.columns.slice();
+  const landingColumnId = insertMovedTile(destColumns, tile, plan);
+
+  let nextSource = { ...sourceDesktop, columns: sourceColumns };
+  if (movedWasFocused && sameDesktop) {
+    nextSource = { ...nextSource, focused: { columnId: landingColumnId, tileId: tile.id } };
+  } else if (movedWasFocused) {
+    nextSource = sourceColumnRemoved
+      ? refocusAfterColumnRemoval(nextSource, source.columnIndex)
+      : refocusAfterTileRemoval(nextSource, source.columnIndex, source.tileIndex);
+  }
+
+  if (sameDesktop) return withDesktop(state, source.desktopIndex, nextSource);
+
+  const nextDest = movedWasFocused
+    ? {
+        ...destDesktop,
+        columns: destColumns,
+        focused: { columnId: landingColumnId, tileId: tile.id },
+      }
+    : { ...destDesktop, columns: destColumns };
+
+  const desktops = state.desktops.slice();
+  desktops[source.desktopIndex] = nextSource;
+  desktops[plan.desktopIndex] = nextDest;
+  return { activeDesktopId: state.activeDesktopId, desktops };
+}
+
+function insertMovedTile(columns: Column[], tile: Tile, plan: MovePlan): ColumnId {
+  if (plan.kind === 'new-column') {
+    const created = createColumnEntity(DEFAULT_COLUMN_WIDTH);
+    const column: Column = { ...created, tiles: withPositions([tile]) };
+    columns.splice(plan.newColumnIndex, 0, column);
+    return created.id;
+  }
+
+  const columnIndex = columns.findIndex((column) => column.id === plan.columnId);
+  const column = columns[columnIndex];
+  if (column === undefined) throw new Error(`Column not found: ${plan.columnId}`);
+  const tiles = column.tiles.slice();
+  tiles.splice(plan.tileIndex, 0, tile);
+  columns[columnIndex] = { ...column, tiles: withPositions(tiles) };
+  return column.id;
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unknown move direction: ${String(value)}`);
 }

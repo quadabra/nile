@@ -30,6 +30,20 @@ function tileAt(column: Column, index = 0): Tile {
   return tile;
 }
 
+function componentsOf(state: LayoutState, desktopIndex = 0): string[][] {
+  return desktopAt(state, desktopIndex).columns.map((column) =>
+    column.tiles.map((tile) => tile.componentId),
+  );
+}
+
+function tileByComponent(state: LayoutState, componentId: string, desktopIndex = 0): Tile {
+  for (const column of desktopAt(state, desktopIndex).columns) {
+    const tile = column.tiles.find((item) => item.componentId === componentId);
+    if (tile !== undefined) return tile;
+  }
+  throw new Error(`missing tile ${componentId}`);
+}
+
 function expectShape(state: LayoutState): void {
   expect(state.desktops.length).toBeGreaterThan(0);
   expect(state.desktops.map((desktop) => desktop.order)).toEqual(
@@ -412,12 +426,232 @@ describe('LayoutEngine tiles', () => {
   });
 });
 
-describe('LayoutEngine deferred operations', () => {
-  it('keeps cross-column move and serialization unimplemented', () => {
-    const state = LayoutEngine.createInitialState();
-    expect(() => LayoutEngine.moveTile(state, 'tile', { direction: 'left' })).toThrow(
-      'Not implemented',
+describe('LayoutEngine moveTile', () => {
+  function columnLayout(): LayoutState {
+    let state = LayoutEngine.openTile(LayoutEngine.createInitialState(), 'a');
+    state = LayoutEngine.openTile(state, 'b');
+    state = LayoutEngine.openTile(state, 'c');
+    state = LayoutEngine.createColumn(state);
+    const rightId = columnAt(desktopAt(state), 1).id;
+    state = LayoutEngine.openTile(state, 'd', { columnId: rightId });
+    state = LayoutEngine.openTile(state, 'e', { columnId: rightId });
+    return state;
+  }
+
+  it('reorders a tile inside its column by direction and by index', () => {
+    const state = freeze(columnLayout());
+    const right = columnAt(desktopAt(state), 1);
+    const movedUp = LayoutEngine.moveTile(state, tileByComponent(state, 'b').id, {
+      direction: 'up',
+    });
+    expect(componentsOf(movedUp)).toEqual([
+      ['b', 'a', 'c'],
+      ['d', 'e'],
+    ]);
+    expect(columnAt(desktopAt(movedUp), 1)).toBe(right);
+
+    const movedDown = LayoutEngine.moveTile(state, tileByComponent(state, 'b').id, {
+      direction: 'down',
+    });
+    expect(componentsOf(movedDown)).toEqual([
+      ['a', 'c', 'b'],
+      ['d', 'e'],
+    ]);
+
+    const movedToTop = LayoutEngine.moveTile(state, tileByComponent(state, 'c').id, {
+      direction: 'up',
+      index: 0,
+    });
+    expect(componentsOf(movedToTop)).toEqual([
+      ['c', 'a', 'b'],
+      ['d', 'e'],
+    ]);
+    expect(tileByComponent(movedToTop, 'c').id).toBe(tileByComponent(state, 'c').id);
+    expectShape(movedUp);
+  });
+
+  it('returns the same state when the tile is already in place', () => {
+    const state = columnLayout();
+    const top = tileByComponent(state, 'a').id;
+    const bottom = tileByComponent(state, 'e').id;
+    const alone = LayoutEngine.openTile(LayoutEngine.createInitialState(), 'only');
+
+    expect(LayoutEngine.moveTile(state, top, { direction: 'up' })).toBe(state);
+    expect(LayoutEngine.moveTile(state, bottom, { direction: 'down' })).toBe(state);
+    expect(LayoutEngine.moveTile(state, top, { index: 0 })).toBe(state);
+    expect(LayoutEngine.moveTile(state, top, {})).toBe(state);
+    expect(LayoutEngine.moveTile(state, top, { direction: 'left' })).toBe(state);
+    expect(
+      LayoutEngine.moveTile(state, bottom, {
+        direction: 'right',
+        desktopId: state.activeDesktopId,
+      }),
+    ).toBe(state);
+    expect(
+      LayoutEngine.moveTile(alone, tileByComponent(alone, 'only').id, { direction: 'new-column' }),
+    ).toBe(alone);
+  });
+
+  it('moves a tile into another column and drops an empty source column', () => {
+    let state = LayoutEngine.openTile(LayoutEngine.createInitialState(), 'a');
+    state = LayoutEngine.openTile(state, 'b');
+    state = LayoutEngine.createColumn(state);
+    const rightId = columnAt(desktopAt(state), 1).id;
+    state = LayoutEngine.openTile(state, 'c', { columnId: rightId });
+    state = LayoutEngine.resizeColumn(state, columnAt(desktopAt(state)).id, 3);
+    const leftId = columnAt(desktopAt(state)).id;
+
+    const byId = LayoutEngine.moveTile(state, tileByComponent(state, 'b').id, {
+      columnId: rightId,
+      index: 0,
+    });
+    expect(componentsOf(byId)).toEqual([['a'], ['b', 'c']]);
+    expect(columnAt(desktopAt(byId)).width).toBe(3);
+    expect(columnAt(desktopAt(byId)).id).toBe(leftId);
+
+    const toRight = LayoutEngine.moveTile(state, tileByComponent(state, 'a').id, {
+      direction: 'right',
+      index: 1,
+    });
+    expect(componentsOf(toRight)).toEqual([['b'], ['c', 'a']]);
+
+    const last = LayoutEngine.moveTile(toRight, tileByComponent(toRight, 'b').id, {
+      direction: 'right',
+    });
+    expect(componentsOf(last)).toEqual([['b', 'c', 'a']]);
+    expect(desktopAt(last).columns).toHaveLength(1);
+    expectShape(last);
+  });
+
+  it('moves a tile left and into a new column on the right', () => {
+    const state = columnLayout();
+    const movedLeft = LayoutEngine.moveTile(state, tileByComponent(state, 'e').id, {
+      direction: 'left',
+    });
+    expect(componentsOf(movedLeft)).toEqual([['a', 'e', 'b', 'c'], ['d']]);
+
+    const extracted = LayoutEngine.moveTile(state, tileByComponent(state, 'b').id, {
+      direction: 'new-column',
+    });
+    expect(componentsOf(extracted)).toEqual([['a', 'c'], ['b'], ['d', 'e']]);
+    expect(columnAt(desktopAt(extracted), 1).width).toBe(1);
+    expect(columnAt(desktopAt(extracted)).id).toBe(columnAt(desktopAt(state)).id);
+
+    const anchored = LayoutEngine.moveTile(state, tileByComponent(state, 'a').id, {
+      direction: 'new-column',
+      columnId: columnAt(desktopAt(state), 1).id,
+    });
+    expect(componentsOf(anchored)).toEqual([['b', 'c'], ['d', 'e'], ['a']]);
+    expectShape(extracted);
+  });
+
+  it('moves a tile onto another desktop without switching the active one', () => {
+    let state = columnLayout();
+    state = LayoutEngine.createDesktop(state, 'other');
+    const activeId = state.activeDesktopId;
+    const otherId = desktopAt(state, 1).id;
+    const origin = tileByComponent(state, 'b');
+    state = LayoutEngine.resizeTile(state, origin.id, 4);
+    state = LayoutEngine.focus(state, columnAt(desktopAt(state)).id, origin.id);
+
+    const ontoEmpty = LayoutEngine.moveTile(state, origin.id, { desktopId: otherId });
+    expect(state.activeDesktopId).toBe(activeId);
+    expect(ontoEmpty.activeDesktopId).toBe(activeId);
+    expect(componentsOf(ontoEmpty)).toEqual([
+      ['a', 'c'],
+      ['d', 'e'],
+    ]);
+    expect(componentsOf(ontoEmpty, 1)).toEqual([['b']]);
+    expect(tileByComponent(ontoEmpty, 'b', 1).height).toBe(4);
+    expect(desktopAt(ontoEmpty).focused?.tileId).toBe(tileByComponent(ontoEmpty, 'c').id);
+    expect(desktopAt(ontoEmpty, 1).focused?.tileId).toBe(origin.id);
+
+    let occupied = LayoutEngine.openTile(state, 'x', { desktopId: otherId });
+    occupied = LayoutEngine.openTile(occupied, 'y', { desktopId: otherId });
+    const other = desktopAt(occupied, 1);
+    const down = LayoutEngine.moveTile(occupied, origin.id, {
+      direction: 'down',
+      desktopId: otherId,
+    });
+    expect(componentsOf(down, 1)).toEqual([['x', 'y', 'b']]);
+    expect(desktopAt(down, 1).focused?.tileId).toBe(origin.id);
+    expect(other.columns[0]?.id).toBe(columnAt(desktopAt(down, 1)).id);
+
+    const up = LayoutEngine.moveTile(occupied, tileByComponent(occupied, 'a').id, {
+      direction: 'up',
+      desktopId: otherId,
+    });
+    expect(componentsOf(up)).toEqual([
+      ['b', 'c'],
+      ['d', 'e'],
+    ]);
+    expect(componentsOf(up, 1)).toEqual([['a', 'x', 'y']]);
+    expect(desktopAt(up).focused?.tileId).toBe(origin.id);
+
+    const toLeftEdge = LayoutEngine.moveTile(occupied, origin.id, {
+      direction: 'left',
+      desktopId: otherId,
+    });
+    expect(componentsOf(toLeftEdge, 1)).toEqual([['b'], ['x', 'y']]);
+
+    const toRightEdge = LayoutEngine.moveTile(occupied, origin.id, {
+      direction: 'new-column',
+      desktopId: otherId,
+    });
+    expect(componentsOf(toRightEdge, 1)).toEqual([['x', 'y'], ['b']]);
+    expectShape(toRightEdge);
+  });
+
+  it('follows focus only for the moved tile and keeps an unfocused move local', () => {
+    const state = columnLayout();
+    const focusedId = tileByComponent(state, 'd').id;
+    const columnId = columnAt(desktopAt(state), 1).id;
+    const focused = LayoutEngine.focus(state, columnId, focusedId);
+
+    const movedNeighbor = LayoutEngine.moveTile(focused, tileByComponent(focused, 'a').id, {
+      direction: 'down',
+    });
+    expect(desktopAt(movedNeighbor).focused).toEqual({ columnId, tileId: focusedId });
+
+    const followed = LayoutEngine.moveTile(focused, focusedId, { direction: 'left', index: 1 });
+    const landing = columnAt(desktopAt(followed));
+    expect(componentsOf(followed)).toEqual([['a', 'd', 'b', 'c'], ['e']]);
+    expect(desktopAt(followed).focused).toEqual({ columnId: landing.id, tileId: focusedId });
+  });
+
+  it('rejects a missing tile, desktop, or column and an index outside the column', () => {
+    let state = freeze(columnLayout());
+    state = freeze(LayoutEngine.createDesktop(state, 'other'));
+    const before = structuredClone(state);
+    const tileId = tileByComponent(state, 'a').id;
+    const otherId = desktopAt(state, 1).id;
+    const foreignColumn = columnAt(desktopAt(state), 1).id;
+
+    expect(() => LayoutEngine.moveTile(state, 'missing', { direction: 'up' })).toThrow(
+      'Tile not found: missing',
     );
+    expect(() => LayoutEngine.moveTile(state, tileId, { desktopId: 'missing' })).toThrow(
+      'Desktop not found: missing',
+    );
+    expect(() => LayoutEngine.moveTile(state, tileId, { columnId: 'missing' })).toThrow(
+      'Column not found: missing',
+    );
+    expect(() =>
+      LayoutEngine.moveTile(state, tileId, { desktopId: otherId, columnId: foreignColumn }),
+    ).toThrow(`Column not found: ${foreignColumn}`);
+    expect(() => LayoutEngine.moveTile(state, tileId, { index: 9 })).toThrow(
+      'Tile index out of range: 9',
+    );
+    expect(() => LayoutEngine.moveTile(state, tileId, { desktopId: otherId, index: 2 })).toThrow(
+      'Tile index out of range: 2',
+    );
+    expect(state).toEqual(before);
+  });
+});
+
+describe('LayoutEngine deferred operations', () => {
+  it('keeps serialization unimplemented', () => {
+    const state = LayoutEngine.createInitialState();
     expect(() => LayoutEngine.toJSON(state)).toThrow('Not implemented');
     expect(() => LayoutEngine.fromJSON({})).toThrow('Not implemented');
   });

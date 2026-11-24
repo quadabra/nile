@@ -278,7 +278,17 @@ export class DesktopSwitcher {
   }
 
   private nextPanelId(): string {
-    this.panelCount += 1;
+    let max = this.panelCount;
+    for (const desktop of this.nile.desktops()) {
+      for (const column of desktop.columns) {
+        for (const tile of column.tiles) {
+          const match = /^panel-(\d+)$/.exec(tile.componentId);
+          const value = match?.[1];
+          if (value !== undefined) max = Math.max(max, Number(value));
+        }
+      }
+    }
+    this.panelCount = max + 1;
     return `panel-${this.panelCount}`;
   }
 

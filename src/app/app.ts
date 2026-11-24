@@ -1,6 +1,7 @@
 import { ChangeDetectionStrategy, Component, inject } from '@angular/core';
 import { DesktopSwitcher } from './components/desktop-switcher/desktop-switcher';
 import { TilingContainer } from './components/tiling-container/tiling-container';
+import { NileService } from './services/nile.service';
 import { ThemeService } from './services/theme.service';
 
 @Component({
@@ -13,5 +14,6 @@ import { ThemeService } from './services/theme.service';
 export class App {
   constructor() {
     inject(ThemeService);
+    inject(NileService);
   }
 }

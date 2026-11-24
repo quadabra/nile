@@ -1,4 +1,5 @@
 import { TestBed } from '@angular/core/testing';
+import { LayoutEngine } from '../core/layout-engine';
 import { App } from './app';
 
 describe('App', () => {
@@ -104,6 +105,28 @@ describe('App', () => {
     root.querySelector<HTMLButtonElement>('[data-testid="desktops-up"]')?.click();
     fixture.detectChanges();
     expect(titles()).toEqual(['1', '2', '3', '4', '5']);
+  });
+
+  it('restores saved desktops into the shell', async () => {
+    let state = LayoutEngine.createInitialState('saved');
+    state = LayoutEngine.createDesktop(state, 'notes');
+    state = LayoutEngine.openTile(state, 'editor');
+    localStorage.setItem('nile-layout', JSON.stringify(LayoutEngine.toJSON(state)));
+
+    const fixture = TestBed.createComponent(App);
+    fixture.detectChanges();
+    await fixture.whenStable();
+    const root = fixture.nativeElement as HTMLElement;
+
+    const titles = [...root.querySelectorAll('[data-testid="desktop"]')].map((button) =>
+      button.getAttribute('title'),
+    );
+    expect(titles).toEqual(['saved', 'notes']);
+    expect(root.textContent).toContain('editor');
+
+    root.querySelector<HTMLButtonElement>('[data-testid="open-tile"]')?.click();
+    fixture.detectChanges();
+    expect(root.textContent).toContain('panel-1');
   });
 
   it('toggles the dark class on the document', () => {

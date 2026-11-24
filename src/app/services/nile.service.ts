@@ -1,4 +1,5 @@
-import { Injectable, computed, signal } from '@angular/core';
+import { isPlatformBrowser } from '@angular/common';
+import { Injectable, PLATFORM_ID, afterNextRender, computed, inject, signal } from '@angular/core';
 import { LayoutEngine } from '../../core/layout-engine';
 import {
   ColumnId,
@@ -14,10 +15,26 @@ import {
   TilePatch,
 } from '../../core/types';
 
-/** Signal-обёртка над LayoutEngine. Каждый метод записывает новый state. */
+const STORAGE_KEY = 'nile-layout';
+
+/** Signal-обёртка над LayoutEngine. Изменения пишутся в localStorage. */
 @Injectable({ providedIn: 'root' })
 export class NileService {
+  private readonly isBrowser = isPlatformBrowser(inject(PLATFORM_ID));
   private readonly state = signal<LayoutState>(LayoutEngine.createInitialState());
+  private hydrated = false;
+  private touched = false;
+
+  constructor() {
+    afterNextRender(() => {
+      if (!this.touched) {
+        const restored = this.readStored();
+        if (restored) this.state.set(restored);
+      }
+      this.hydrated = true;
+      if (this.touched) this.persist();
+    });
+  }
 
   /** Полное состояние. Не мутировать. */
   readonly layout = this.state.asReadonly();
@@ -93,6 +110,28 @@ export class NileService {
   }
 
   private commit(update: (state: LayoutState) => LayoutState): void {
+    this.touched = true;
     this.state.update(update);
+    this.persist();
+  }
+
+  private persist(): void {
+    if (!this.isBrowser || !this.hydrated) return;
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(LayoutEngine.toJSON(this.state())));
+    } catch {
+      // Приватный режим не должен ломать интерфейс.
+    }
+  }
+
+  private readStored(): LayoutState | null {
+    if (!this.isBrowser) return null;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw === null || raw.trim() === '') return null;
+      return LayoutEngine.fromJSON(JSON.parse(raw));
+    } catch {
+      return null;
+    }
   }
 }

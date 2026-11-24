@@ -17,6 +17,8 @@ import {
   OpenTileOptions,
   CreateColumnOptions,
   MoveTileTarget,
+  TileDropEdge,
+  TileDropTarget,
 } from './types';
 
 interface ColumnLocation {
@@ -276,9 +278,7 @@ export class LayoutEngine {
     const insertAt = options?.index ?? column.tiles.length;
     assertInsertIndex(insertAt, column.tiles.length, 'Tile index');
 
-    const tiles = column.tiles.slice();
-    tiles.splice(insertAt, 0, tile);
-    const nextColumn: Column = { ...column, tiles: withPositions(tiles) };
+    const nextColumn: Column = { ...column, tiles: insertNewRow(column.tiles, insertAt, tile) };
     const nextColumns = columns.slice();
     nextColumns[columnIndex] = nextColumn;
 
@@ -325,6 +325,7 @@ export class LayoutEngine {
     if (minHeight !== undefined && height < minHeight) {
       throw new Error('Tile height must not be less than minHeight');
     }
+    if (patch.height !== undefined) assertRowHeight(column.tiles, tile.row, height);
     if (patch.position !== undefined) assertTilePosition(position, column.tiles.length);
 
     const nextProps = patch.props !== undefined ? cloneProps(patch.props) : tile.props;
@@ -340,13 +341,15 @@ export class LayoutEngine {
     if (patch.minHeight !== undefined) updated.minHeight = patch.minHeight;
     if (patch.props !== undefined) updated.props = nextProps;
 
-    let tiles = column.tiles.slice();
-    tiles[location.tileIndex] = updated;
+    let tiles: Tile[];
     if (position !== tile.position) {
-      const moved = tiles.splice(location.tileIndex, 1)[0];
-      if (moved === undefined) throw new Error(`Tile not found: ${tileId}`);
-      tiles.splice(position, 0, moved);
-      tiles = withPositions(tiles);
+      tiles = relocateAsOwnRow(column.tiles, updated, position);
+    } else {
+      tiles = column.tiles.map((item) => {
+        if (item.id === tile.id) return updated;
+        if (patch.height !== undefined && item.row === tile.row) return { ...item, height };
+        return item;
+      });
     }
 
     const columns = desktop.columns.slice();
@@ -362,7 +365,7 @@ export class LayoutEngine {
     const location = requireTile(state, tileId, desktopId);
     const desktop = desktopAt(state, location.desktopIndex);
     const column = columnAt(desktop, location.columnIndex);
-    const tiles = withPositions(column.tiles.filter((tile) => tile.id !== tileId));
+    const tiles = withoutTile(column.tiles, tileId);
 
     const columns = desktop.columns.slice();
     const columnRemoved = tiles.length === 0;
@@ -417,6 +420,75 @@ export class LayoutEngine {
     const plan = planMove(state, source, target);
     if (plan === undefined) return state;
     return commitMove(state, source, plan);
+  }
+
+  /**
+   * Кладёт тайл на край другого тайла и делит эту зону пополам.
+   * `left` и `right` делят ширину целевого тайла внутри его ряда.
+   * `above` и `below` делят высоту всего ряда: новая панель получает свой ряд.
+   * Пустой ряд и пустая колонка после ухода тайла удаляются, соседи занимают место.
+   * Если тайл уже стоит у этого края, возвращается тот же `state`.
+   * Активный десктоп не переключается. Фокус следует только за перенесённым тайлом.
+   *
+   * @throws Если тайла нет или новая высота меньше `minHeight`.
+   */
+  static placeTile(state: LayoutState, tileId: TileId, target: TileDropTarget): LayoutState {
+    const source = requireTile(state, tileId);
+    const targetLocation = requireTile(state, target.tileId);
+    if (tileId === target.tileId) return state;
+    if (sameDropPlace(state, source, targetLocation, target.edge)) return state;
+
+    const sourceDesktop = desktopAt(state, source.desktopIndex);
+    const origin = columnAt(sourceDesktop, source.columnIndex);
+    const tile = tileAt(sourceDesktop, source);
+    const movedWasFocused = sourceDesktop.focused?.tileId === tile.id;
+    const sameDesktop = source.desktopIndex === targetLocation.desktopIndex;
+
+    const remaining = withoutTile(origin.tiles, tile.id);
+    const sourceColumnRemoved = remaining.length === 0;
+    const sourceColumns = sourceDesktop.columns.slice();
+    if (sourceColumnRemoved) sourceColumns.splice(source.columnIndex, 1);
+    else sourceColumns[source.columnIndex] = { ...origin, tiles: remaining };
+
+    const workingDesktops = state.desktops.slice();
+    const workingSource: Desktop = { ...sourceDesktop, columns: sourceColumns };
+    workingDesktops[source.desktopIndex] = workingSource;
+    const landed = requireTile(
+      { activeDesktopId: state.activeDesktopId, desktops: workingDesktops },
+      target.tileId,
+    );
+    const destDesktop = desktopAt(
+      { activeDesktopId: state.activeDesktopId, desktops: workingDesktops },
+      landed.desktopIndex,
+    );
+    const destColumn = columnAt(destDesktop, landed.columnIndex);
+    const nextColumn = splitAtEdge(destColumn, target.tileId, target.edge, tile);
+
+    const destColumns = destDesktop.columns.slice();
+    destColumns[landed.columnIndex] = nextColumn;
+
+    if (sameDesktop) {
+      const desktop: Desktop = { ...workingSource, columns: destColumns };
+      if (movedWasFocused) desktop.focused = { columnId: nextColumn.id, tileId: tile.id };
+      return withDesktop(state, source.desktopIndex, desktop);
+    }
+
+    const nextSource = movedWasFocused
+      ? sourceColumnRemoved
+        ? refocusAfterColumnRemoval(workingSource, source.columnIndex)
+        : refocusAfterTileRemoval(workingSource, source.columnIndex, source.tileIndex)
+      : workingSource;
+    const nextDest: Desktop = movedWasFocused
+      ? {
+          ...destDesktop,
+          columns: destColumns,
+          focused: { columnId: nextColumn.id, tileId: tile.id },
+        }
+      : { ...destDesktop, columns: destColumns };
+    const desktops = state.desktops.slice();
+    desktops[source.desktopIndex] = nextSource;
+    desktops[landed.desktopIndex] = nextDest;
+    return { activeDesktopId: state.activeDesktopId, desktops };
   }
 
   /**
@@ -495,6 +567,8 @@ function createTile(componentId: string, height: number, props?: Record<string, 
     id: createId('tile'),
     componentId,
     height,
+    width: 1,
+    row: 0,
     position: 0,
   };
   if (props !== undefined) tile.props = cloneProps(props);
@@ -544,6 +618,183 @@ function withPositions(tiles: readonly Tile[]): Tile[] {
   return tiles.map((tile, index) =>
     tile.position === index ? tile : { ...tile, position: index },
   );
+}
+
+function groupRows(tiles: readonly Tile[]): Tile[][] {
+  const rows: Tile[][] = [];
+  const indexByRow = new Map<number, number>();
+  for (const tile of tiles) {
+    const existing = indexByRow.get(tile.row);
+    if (existing === undefined) {
+      indexByRow.set(tile.row, rows.length);
+      rows.push([tile]);
+    } else {
+      const row = rows[existing];
+      if (row !== undefined) row.push(tile);
+    }
+  }
+  return rows;
+}
+
+function collapseSolo(rows: Tile[][]): Tile[][] {
+  return rows.map((row) => {
+    const tile = row[0];
+    if (row.length !== 1 || tile === undefined || tile.width === 1) return row;
+    return [{ ...tile, width: 1 }];
+  });
+}
+
+function flattenRows(rows: readonly (readonly Tile[])[]): Tile[] {
+  const tiles: Tile[] = [];
+  rows.forEach((row, rowIndex) => {
+    for (const tile of row) {
+      tiles.push(tile.row === rowIndex ? tile : { ...tile, row: rowIndex });
+    }
+  });
+  return withPositions(tiles);
+}
+
+function insertNewRow(tiles: readonly Tile[], index: number, tile: Tile): Tile[] {
+  const rows = groupRows(tiles);
+  let rowIndex = rows.length;
+  const marker = tiles[index];
+  if (marker !== undefined) {
+    const found = rows.findIndex((row) => row.some((item) => item.id === marker.id));
+    if (found >= 0) rowIndex = found;
+  }
+  rows.splice(rowIndex, 0, [{ ...tile, width: 1, row: 0 }]);
+  return flattenRows(rows);
+}
+
+function withoutTile(tiles: readonly Tile[], tileId: TileId): Tile[] {
+  const rows = groupRows(tiles)
+    .map((row) => row.filter((tile) => tile.id !== tileId))
+    .filter((row) => row.length > 0);
+  return flattenRows(collapseSolo(rows));
+}
+
+function relocateAsOwnRow(tiles: readonly Tile[], moved: Tile, index: number): Tile[] {
+  return insertNewRow(withoutTile(tiles, moved.id), index, moved);
+}
+
+function assertRowHeight(tiles: readonly Tile[], row: number, height: number): void {
+  for (const tile of tiles) {
+    if (tile.row === row && tile.minHeight !== undefined && height < tile.minHeight) {
+      throw new Error('Tile height must not be less than minHeight');
+    }
+  }
+}
+
+function sameDropPlace(
+  state: LayoutState,
+  source: TileLocation,
+  target: TileLocation,
+  edge: TileDropEdge,
+): boolean {
+  if (source.desktopIndex !== target.desktopIndex || source.columnIndex !== target.columnIndex) {
+    return false;
+  }
+  const tiles = sourceColumn(state, source).tiles;
+  const from = tiles[source.tileIndex];
+  const to = tiles[target.tileIndex];
+  if (from === undefined || to === undefined) return false;
+
+  if (edge === 'left' || edge === 'right') {
+    if (from.row !== to.row) return false;
+    const row = tiles.filter((tile) => tile.row === from.row);
+    const fromIndex = row.findIndex((tile) => tile.id === from.id);
+    const toIndex = row.findIndex((tile) => tile.id === to.id);
+    return edge === 'left' ? fromIndex === toIndex - 1 : fromIndex === toIndex + 1;
+  }
+
+  if (tiles.filter((tile) => tile.row === from.row).length !== 1) return false;
+  return edge === 'above' ? from.row === to.row - 1 : from.row === to.row + 1;
+}
+
+function splitAtEdge(column: Column, targetId: TileId, edge: TileDropEdge, incoming: Tile): Column {
+  switch (edge) {
+    case 'left':
+    case 'right':
+      return splitBeside(column, targetId, edge, incoming);
+    case 'above':
+    case 'below':
+      return splitAcross(column, targetId, edge, incoming);
+    default:
+      return assertNever(edge);
+  }
+}
+
+function splitBeside(
+  column: Column,
+  targetId: TileId,
+  edge: 'left' | 'right',
+  incoming: Tile,
+): Column {
+  const rows = groupRows(column.tiles);
+  const rowIndex = rows.findIndex((row) => row.some((tile) => tile.id === targetId));
+  const row = rows[rowIndex];
+  if (row === undefined) throw new Error(`Tile not found: ${targetId}`);
+  const targetIndex = row.findIndex((tile) => tile.id === targetId);
+  const target = row[targetIndex];
+  if (target === undefined) throw new Error(`Tile not found: ${targetId}`);
+  if (incoming.minHeight !== undefined && target.height < incoming.minHeight) {
+    throw new Error('Tile height must not be less than minHeight');
+  }
+
+  const half = target.width / 2;
+  const nextRow = row.slice();
+  nextRow[targetIndex] = { ...target, width: half };
+  nextRow.splice(edge === 'left' ? targetIndex : targetIndex + 1, 0, {
+    ...incoming,
+    width: half,
+    height: target.height,
+    row: target.row,
+  });
+  rows[rowIndex] = nextRow;
+  return { ...column, tiles: flattenRows(rows) };
+}
+
+function splitAcross(
+  column: Column,
+  targetId: TileId,
+  edge: 'above' | 'below',
+  incoming: Tile,
+): Column {
+  const rows = groupRows(column.tiles);
+  const rowIndex = rows.findIndex((row) => row.some((tile) => tile.id === targetId));
+  const row = rows[rowIndex];
+  const first = row?.[0];
+  if (row === undefined || first === undefined) throw new Error(`Tile not found: ${targetId}`);
+
+  const half = first.height / 2;
+  assertRowHeight(row, first.row, half);
+  if (incoming.minHeight !== undefined && half < incoming.minHeight) {
+    throw new Error('Tile height must not be less than minHeight');
+  }
+
+  rows[rowIndex] = row.map((tile) => ({ ...tile, height: half }));
+  rows.splice(edge === 'above' ? rowIndex : rowIndex + 1, 0, [
+    { ...incoming, width: 1, height: half, row: 0 },
+  ]);
+  return { ...column, tiles: flattenRows(rows) };
+}
+
+function normalizeParsedTiles(tiles: Tile[]): Tile[] {
+  const rows = groupRows(tiles);
+  for (const row of rows) {
+    const height = row[0]?.height;
+    if (row.some((tile) => tile.height !== height)) {
+      throw new Error('Tiles in the same row must share a height');
+    }
+  }
+  return flattenRows(collapseSolo(rows));
+}
+
+function readRow(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new Error('Tile row must be an integer greater than or equal to 0');
+  }
+  return value;
 }
 
 function clearFocus(desktop: Desktop): Desktop {
@@ -891,7 +1142,7 @@ function commitMove(state: LayoutState, source: TileLocation, plan: MovePlan): L
   const movedWasFocused = sourceDesktop.focused?.tileId === tile.id;
   const sameDesktop = plan.desktopIndex === source.desktopIndex;
 
-  const remaining = withPositions(origin.tiles.filter((item) => item.id !== tile.id));
+  const remaining = withoutTile(origin.tiles, tile.id);
   const sourceColumnRemoved = remaining.length === 0;
   const sourceColumns = sourceDesktop.columns.slice();
   if (sourceColumnRemoved) sourceColumns.splice(source.columnIndex, 1);
@@ -929,7 +1180,7 @@ function commitMove(state: LayoutState, source: TileLocation, plan: MovePlan): L
 function insertMovedTile(columns: Column[], tile: Tile, plan: MovePlan): ColumnId {
   if (plan.kind === 'new-column') {
     const created = createColumnEntity(DEFAULT_COLUMN_WIDTH);
-    const column: Column = { ...created, tiles: withPositions([tile]) };
+    const column: Column = { ...created, tiles: insertNewRow([], 0, tile) };
     columns.splice(plan.newColumnIndex, 0, column);
     return created.id;
   }
@@ -937,9 +1188,7 @@ function insertMovedTile(columns: Column[], tile: Tile, plan: MovePlan): ColumnI
   const columnIndex = columns.findIndex((column) => column.id === plan.columnId);
   const column = columns[columnIndex];
   if (column === undefined) throw new Error(`Column not found: ${plan.columnId}`);
-  const tiles = column.tiles.slice();
-  tiles.splice(plan.tileIndex, 0, tile);
-  columns[columnIndex] = { ...column, tiles: withPositions(tiles) };
+  columns[columnIndex] = { ...column, tiles: insertNewRow(column.tiles, plan.tileIndex, tile) };
   return column.id;
 }
 
@@ -951,6 +1200,8 @@ interface SerializedTile {
   id: string;
   componentId: string;
   height: number;
+  width: number;
+  row: number;
   position: number;
   props?: Record<string, unknown>;
   minHeight?: number;
@@ -1023,6 +1274,8 @@ function serializeTile(tile: Tile): SerializedTile {
     id: tile.id,
     componentId: tile.componentId,
     height: tile.height,
+    width: tile.width,
+    row: tile.row,
     position: tile.position,
   };
   if (tile.props !== undefined) serialized.props = tile.props;
@@ -1078,7 +1331,7 @@ function parseColumn(data: unknown, index: number, ids: ParseIds): Column {
     throw new Error('Column width must not be less than minWidth');
   }
 
-  const tiles = withPositions(
+  const tiles = normalizeParsedTiles(
     readArray(record['tiles'], 'Column tiles').map((item, tileIndex) =>
       parseTile(item, tileIndex, ids),
     ),
@@ -1100,8 +1353,10 @@ function parseTile(data: unknown, index: number, ids: ParseIds): Tile {
     throw new Error('Tile height must not be less than minHeight');
   }
   readOptionalFinite(record['position'], 'Tile position');
+  const width = record['width'] === undefined ? 1 : readPositive(record['width'], 'Tile width');
+  const row = record['row'] === undefined ? index : readRow(record['row']);
 
-  const tile: Tile = { id, componentId, height, position: index };
+  const tile: Tile = { id, componentId, height, width, row, position: index };
   if (minHeight !== undefined) tile.minHeight = minHeight;
   if (record['props'] !== undefined) tile.props = readProps(record['props']);
   return tile;

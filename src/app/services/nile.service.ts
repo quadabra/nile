@@ -9,6 +9,7 @@ import {
   LayoutState,
   MoveTileTarget,
   OpenTileOptions,
+  TileDropTarget,
   TileId,
   TilePatch,
 } from '../../core/types';
@@ -81,6 +82,10 @@ export class NileService {
 
   moveTile(tileId: TileId, target: MoveTileTarget): void {
     this.commit((state) => LayoutEngine.moveTile(state, tileId, target));
+  }
+
+  placeTile(tileId: TileId, target: TileDropTarget): void {
+    this.commit((state) => LayoutEngine.placeTile(state, tileId, target));
   }
 
   focus(columnId: ColumnId, tileId: TileId, desktopId?: DesktopId): void {

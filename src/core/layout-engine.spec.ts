@@ -56,6 +56,18 @@ function expectShape(state: LayoutState): void {
       expect(column.tiles.map((tile) => tile.position)).toEqual(
         column.tiles.map((_, index) => index),
       );
+      let previousRow = -1;
+      const rowHeight = new Map<number, number>();
+      for (const tile of column.tiles) {
+        expect(tile.width).toBeGreaterThan(0);
+        expect(tile.height).toBeGreaterThan(0);
+        expect(tile.row).toBeGreaterThanOrEqual(previousRow);
+        if (tile.row !== previousRow) expect(tile.row).toBe(previousRow + 1);
+        previousRow = tile.row;
+        const height = rowHeight.get(tile.row);
+        if (height === undefined) rowHeight.set(tile.row, tile.height);
+        else expect(tile.height).toBe(height);
+      }
     }
   }
 }
@@ -646,6 +658,86 @@ describe('LayoutEngine moveTile', () => {
       'Tile index out of range: 2',
     );
     expect(state).toEqual(before);
+  });
+});
+
+describe('LayoutEngine placeTile', () => {
+  it('splits a row sideways and keeps the row height as a share of the column', () => {
+    let state = LayoutEngine.openTile(LayoutEngine.createInitialState(), 'top');
+    state = LayoutEngine.openTile(state, 'bottom', { height: 2 });
+    state = LayoutEngine.openTile(state, 'side');
+    const side = tileByComponent(state, 'side');
+    const bottom = tileByComponent(state, 'bottom');
+
+    const placed = LayoutEngine.placeTile(state, side.id, { tileId: bottom.id, edge: 'right' });
+    const tiles = columnAt(desktopAt(placed)).tiles;
+    expect(tiles.map((tile) => [tile.componentId, tile.row, tile.width, tile.height])).toEqual([
+      ['top', 0, 1, 1],
+      ['bottom', 1, 0.5, 2],
+      ['side', 1, 0.5, 2],
+    ]);
+    expect(LayoutEngine.placeTile(placed, side.id, { tileId: bottom.id, edge: 'right' })).toBe(
+      placed,
+    );
+    expectShape(placed);
+  });
+
+  it('splits the target row in half and collapses an emptied row', () => {
+    let state = LayoutEngine.openTile(LayoutEngine.createInitialState(), 'a', { height: 2 });
+    state = LayoutEngine.openTile(state, 'b');
+    const above = LayoutEngine.placeTile(state, tileByComponent(state, 'b').id, {
+      tileId: tileByComponent(state, 'a').id,
+      edge: 'above',
+    });
+    expect(
+      columnAt(desktopAt(above)).tiles.map((tile) => [tile.componentId, tile.height, tile.row]),
+    ).toEqual([
+      ['b', 1, 0],
+      ['a', 1, 1],
+    ]);
+
+    const joined = LayoutEngine.placeTile(above, tileByComponent(above, 'a').id, {
+      tileId: tileByComponent(above, 'b').id,
+      edge: 'right',
+    });
+    expect(
+      columnAt(desktopAt(joined)).tiles.map((tile) => [tile.componentId, tile.row, tile.width]),
+    ).toEqual([
+      ['b', 0, 0.5],
+      ['a', 0, 0.5],
+    ]);
+    expect(LayoutEngine.toJSON(joined)).toEqual(
+      JSON.parse(JSON.stringify(LayoutEngine.toJSON(joined))),
+    );
+    expect(LayoutEngine.fromJSON(LayoutEngine.toJSON(joined))).toEqual(joined);
+
+    const closed = LayoutEngine.closeTile(joined, tileByComponent(joined, 'a').id);
+    expect(tileByComponent(closed, 'b')).toMatchObject({ width: 1, row: 0, position: 0 });
+    expectShape(closed);
+  });
+
+  it('follows focus, drops an empty column, and rejects a missing tile', () => {
+    let state = LayoutEngine.openTile(LayoutEngine.createInitialState(), 'left');
+    const leftId = tileByComponent(state, 'left').id;
+    state = LayoutEngine.createColumn(state);
+    const rightColumn = columnAt(desktopAt(state), 1).id;
+    state = LayoutEngine.openTile(state, 'right', { columnId: rightColumn });
+    state = LayoutEngine.focus(state, columnAt(desktopAt(state)).id, leftId);
+    const before = structuredClone(state);
+
+    const moved = LayoutEngine.placeTile(state, leftId, {
+      tileId: tileByComponent(state, 'right').id,
+      edge: 'left',
+    });
+    expect(componentsOf(moved)).toEqual([['left', 'right']]);
+    expect(desktopAt(moved).focused?.tileId).toBe(leftId);
+    expect(desktopAt(moved).columns).toHaveLength(1);
+
+    expect(() =>
+      LayoutEngine.placeTile(state, 'missing', { tileId: leftId, edge: 'below' }),
+    ).toThrow('Tile not found: missing');
+    expect(state).toEqual(before);
+    expectShape(moved);
   });
 });
 

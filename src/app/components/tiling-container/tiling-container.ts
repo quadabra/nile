@@ -1,6 +1,7 @@
 import { ChangeDetectionStrategy, Component, inject } from '@angular/core';
 import { ColumnComponent } from '../column/column';
 import { NileService } from '../../services/nile.service';
+import { TileDragService } from '../../services/tile-drag.service';
 
 @Component({
   selector: 'app-tiling-container',
@@ -21,8 +22,19 @@ import { NileService } from '../../services/nile.service';
         </div>
       }
     }
+    @if (drag.preview(); as preview) {
+      <div
+        class="pointer-events-none fixed z-30 rounded-md bg-primary/30 ring-2 ring-primary"
+        data-testid="drop-preview"
+        [style.top.px]="preview.top"
+        [style.left.px]="preview.left"
+        [style.width.px]="preview.width"
+        [style.height.px]="preview.height"
+      ></div>
+    }
   `,
 })
 export class TilingContainer {
   protected readonly nile = inject(NileService);
+  protected readonly drag = inject(TileDragService);
 }
